@@ -55,7 +55,9 @@ __all__ = [
     "box_area",
     "iou_pair",
     "iou_matrix",
+    "coverage_matrix",
     "match_detections_to_seats",
+    "match_chairs_to_occupants",
     "SeatAssignment",
 ]
 
@@ -158,6 +160,38 @@ def iou_matrix(boxes_a_xyxy: np.ndarray, boxes_b_xyxy: np.ndarray) -> np.ndarray
     return np.where(union > _EPS, inter / union, 0.0)
 
 
+def coverage_matrix(container_xyxy: np.ndarray, content_xyxy: np.ndarray) -> np.ndarray:
+    """Fraction of each *container* box's own area covered by each *content* box.
+
+    Rows are containers (e.g. a detected chair), columns are content (e.g. a
+    detected person). Unlike IoU, this normalises only by the container's
+    area, not the union — so a much larger content box doesn't get penalised.
+    That matters here because a seated person's bounding box is usually far
+    taller than the chair underneath them (it includes their torso and head),
+    so plain IoU under-scores real occupancy for anything but a
+    person-sized container.
+
+    Shapes: A is (N, 4), B is (M, 4) -> returns (N, M), each value in [0, 1].
+    """
+    A, _ = _as_2d(container_xyxy) if np.asarray(container_xyxy).size else (
+        np.empty((0, 4)), False)
+    B, _ = _as_2d(content_xyxy) if np.asarray(content_xyxy).size else (
+        np.empty((0, 4)), False)
+    if A.shape[0] == 0 or B.shape[0] == 0:
+        return np.zeros((A.shape[0], B.shape[0]), dtype=np.float64)
+
+    inter_x1 = np.maximum(A[:, None, 0], B[None, :, 0])
+    inter_y1 = np.maximum(A[:, None, 1], B[None, :, 1])
+    inter_x2 = np.minimum(A[:, None, 2], B[None, :, 2])
+    inter_y2 = np.minimum(A[:, None, 3], B[None, :, 3])
+    inter_w = np.clip(inter_x2 - inter_x1, 0.0, None)
+    inter_h = np.clip(inter_y2 - inter_y1, 0.0, None)
+    inter = inter_w * inter_h
+
+    area_a = box_area(A)[:, None]                # (N, 1)
+    return np.where(area_a > _EPS, inter / area_a, 0.0)
+
+
 # ----------------------------------------------------------------------------
 # Seat <-> detection assignment (greedy, deterministic)
 # ----------------------------------------------------------------------------
@@ -169,63 +203,76 @@ class SeatAssignment:
     occupied: bool
 
 
+def _greedy_match(scores: np.ndarray, threshold: float) -> list[SeatAssignment]:
+    """Shared core of both matchers below: repeatedly take the globally
+    largest remaining score above threshold, lock that (row, col) pair, and
+    strike out that row and column so neither is reused (one-to-one).
+
+    Greedy (rather than Hungarian) is deliberate: counts per frame are tiny
+    (tens), the score is a single scalar, and greedy maximum-weight matching
+    is both O(N*M) to build + O(k) to resolve and fully deterministic, which
+    keeps the occupancy signal stable frame-to-frame (no flip-flopping from an
+    optimal solver picking an equal-cost alternative). Ties are broken by
+    lower index (via a stable sort), so identical scenes always yield
+    identical assignments.
+    """
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError(f"threshold must be in [0, 1], got {threshold}")
+
+    n_rows, n_cols = scores.shape
+    row_used = np.zeros(n_rows, dtype=bool)
+    col_used = np.zeros(n_cols, dtype=bool)
+    assignments: dict[int, SeatAssignment] = {}
+
+    if scores.size:
+        flat_order = np.argsort(scores, axis=None, kind="stable")[::-1]
+        for flat_idx in flat_order:
+            r, c = divmod(int(flat_idx), n_cols)
+            score = float(scores[r, c])
+            if score < threshold:
+                break  # remaining pairs are all below threshold (sorted desc)
+            if row_used[r] or col_used[c]:
+                continue
+            row_used[r] = True
+            col_used[c] = True
+            assignments[r] = SeatAssignment(r, c, score, occupied=True)
+
+    return [assignments.get(r, SeatAssignment(r, -1, 0.0, occupied=False)) for r in range(n_rows)]
+
+
 def match_detections_to_seats(
     seat_boxes_xyxy: np.ndarray,
     person_boxes_xyxy: np.ndarray,
     iou_threshold: float = 0.30,
 ) -> list[SeatAssignment]:
-    """Assign at most one person detection to each fixed seat region.
-
-    Algorithm (greedy maximum-IoU, one-to-one):
-      1. Compute the full seat x person IoU matrix.
-      2. Repeatedly take the globally largest remaining IoU above threshold,
-         lock that (seat, person) pair, and strike out that seat row and person
-         column so neither is reused.
-      3. Seats with no surviving pair above threshold are marked empty.
-
-    Greedy (rather than Hungarian) is deliberate: seat counts per frame are tiny
-    (tens), the score is a single scalar, and greedy maximum-weight matching is
-    both O(S*P) to build + O(k) to resolve and fully deterministic, which keeps
-    the occupancy signal stable frame-to-frame (no flip-flopping from an optimal
-    solver picking an equal-cost alternative).
-
-    Ties are broken by lower index (via a stable argmax on a flattened matrix),
-    so identical scenes always yield identical assignments.
+    """Assign at most one person detection to each *fixed, calibrated* seat
+    region (e.g. configs/seat_layout.json), scored by IoU. Seat and person
+    boxes are expected to be roughly the same scale here — see
+    match_chairs_to_occupants for dynamically detected chairs, where they
+    are not.
     """
-    if not 0.0 <= iou_threshold <= 1.0:
-        raise ValueError(f"iou_threshold must be in [0, 1], got {iou_threshold}")
-
     seats, _ = _as_2d(seat_boxes_xyxy) if np.asarray(seat_boxes_xyxy).size else (
         np.empty((0, 4)), False)
     persons, _ = _as_2d(person_boxes_xyxy) if np.asarray(person_boxes_xyxy).size else (
         np.empty((0, 4)), False)
+    return _greedy_match(iou_matrix(seats, persons), iou_threshold)
 
-    n_seats = seats.shape[0]
-    scores = iou_matrix(seats, persons)          # (S, P)
-    seat_used = np.zeros(n_seats, dtype=bool)
-    person_used = np.zeros(persons.shape[0], dtype=bool)
 
-    assignments: dict[int, SeatAssignment] = {}
-
-    # Flatten and sort candidate pairs by descending IoU for the greedy sweep.
-    if scores.size:
-        flat_order = np.argsort(scores, axis=None, kind="stable")[::-1]
-        for flat_idx in flat_order:
-            s, p = divmod(int(flat_idx), scores.shape[1])
-            iou = float(scores[s, p])
-            if iou < iou_threshold:
-                break  # remaining pairs are all below threshold (sorted desc)
-            if seat_used[s] or person_used[p]:
-                continue
-            seat_used[s] = True
-            person_used[p] = True
-            assignments[s] = SeatAssignment(s, p, iou, occupied=True)
-
-    # Fill in the empty seats so the output is exactly one entry per seat, in order.
-    result: list[SeatAssignment] = []
-    for s in range(n_seats):
-        result.append(assignments.get(s, SeatAssignment(s, -1, 0.0, occupied=False)))
-    return result
+def match_chairs_to_occupants(
+    chair_boxes_xyxy: np.ndarray,
+    person_boxes_xyxy: np.ndarray,
+    coverage_threshold: float = 0.30,
+) -> list[SeatAssignment]:
+    """Assign at most one person detection to each *dynamically detected*
+    chair (from a general-purpose object detector on an arbitrary photo),
+    scored by coverage (intersection / chair area) rather than IoU, since a
+    seated person's box is usually much taller than the chair beneath them.
+    """
+    chairs, _ = _as_2d(chair_boxes_xyxy) if np.asarray(chair_boxes_xyxy).size else (
+        np.empty((0, 4)), False)
+    persons, _ = _as_2d(person_boxes_xyxy) if np.asarray(person_boxes_xyxy).size else (
+        np.empty((0, 4)), False)
+    return _greedy_match(coverage_matrix(chairs, persons), coverage_threshold)
 
 
 # ----------------------------------------------------------------------------
@@ -272,7 +319,25 @@ def _selftest() -> None:
     out2 = match_detections_to_seats(seats[:1], two_people, iou_threshold=0.1)
     assert out2[0].detection_index == 1, "closer person (higher IoU) must win the seat"
 
-    print("[ OK ] seat_geometry self-test passed (8 assertions).")
+    # 9. Coverage vs IoU: a small chair fully engulfed by a much taller person
+    #    box scores near-1 coverage but poor IoU — this is the real-world case
+    #    (seated person's box includes their torso/head above the chair) that
+    #    match_chairs_to_occupants exists to handle correctly.
+    small_chair = np.array([10, 40, 30, 60], dtype=float)     # 20x20
+    tall_person = np.array([5, 0, 35, 60], dtype=float)       # 30x60, contains the chair
+    cov = coverage_matrix(small_chair, tall_person)
+    assert abs(cov[0, 0] - 1.0) < 1e-9, "chair fully inside person box -> coverage 1"
+    assert iou_pair(small_chair, tall_person) < 0.3, "same case should score poorly on IoU"
+
+    # 10. An empty chair (no person nearby) is correctly left unoccupied even
+    #     when other chairs in the same frame are taken.
+    chairs = np.array([small_chair, [200, 200, 220, 220]], dtype=float)  # 2nd chair is empty
+    people = np.array([tall_person], dtype=float)
+    chair_out = match_chairs_to_occupants(chairs, people, coverage_threshold=0.3)
+    assert chair_out[0].occupied, "chair covered by a person must be occupied"
+    assert not chair_out[1].occupied, "chair with no nearby person must stay empty"
+
+    print("[ OK ] seat_geometry self-test passed (14 assertions).")
 
 
 if __name__ == "__main__":

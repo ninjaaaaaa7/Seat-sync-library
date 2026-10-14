@@ -6,11 +6,11 @@ with the bounding boxes drawn so you can eyeball it.
 
 Works with whichever weights you point it at:
   * your trained seat model (default) -> classes empty_seat / occupied_seat / person
-  * stock COCO model (weights/yolov8n.pt) -> person, chair, etc. (for real photos)
+  * stock COCO model (weights/yolo26n.pt) -> person, chair, etc. (for real photos)
 
 Examples:
     py -3.10 scripts\detect_image.py C:\path\to\photo.jpg
-    py -3.10 scripts\detect_image.py photo.jpg --weights weights\yolov8n.pt --conf 0.25 --show
+    py -3.10 scripts\detect_image.py photo.jpg --weights weights\yolo26n.pt --conf 0.25 --show
     py -3.10 scripts\detect_image.py C:\Users\dhruv\datasets\seat_sync\images\test\test_00000.jpg --conf 0.05
 
 --show opens the annotated result in your default image viewer (Windows).
@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.image.is_file():
         _fatal(f"Image not found: {args.image}")
     if not args.weights.is_file():
-        _fatal(f"Weights not found: {args.weights}. Train first, or use --weights weights\\yolov8n.pt")
+        _fatal(f"Weights not found: {args.weights}. Train first, or use --weights weights\\yolo26n.pt")
 
     # Anchor CWD to project root so any stray Ultralytics writes stay writable.
     os.chdir(_PROJECT_ROOT)

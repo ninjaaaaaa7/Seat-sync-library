@@ -59,6 +59,7 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from starlette.concurrency import run_in_threadpool  # noqa: E402
 
 from core.occupancy_engine import OccupancyEngine  # noqa: E402
+from core.seat_geometry import match_chairs_to_occupants  # noqa: E402
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 _VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
@@ -91,9 +92,9 @@ class Config:
         int(x) for x in os.environ.get("SEAT_OCCUPANT_CLASSES", "2").split(",") if x.strip())
     stream_fps = float(os.environ.get("SEAT_STREAM_FPS", "4"))
     # The /detect endpoint uses a general-purpose model so real photos of people
-    # actually get detected. Defaults to the stock COCO yolov8n (person, chair, ...).
+    # actually get detected. Defaults to the stock COCO yolo26n (person, chair, ...).
     detect_weights = os.environ.get(
-        "SEAT_DETECT_WEIGHTS", str(_PROJECT_ROOT / "weights" / "yolov8n.pt"))
+        "SEAT_DETECT_WEIGHTS", str(_PROJECT_ROOT / "weights" / "yolo26n.pt"))
     detect_imgsz = int(os.environ.get("SEAT_DETECT_IMGSZ", "640"))
     # Library-specific object filtering: 0 (person), 56 (chair), 60 (table)
     detect_classes = tuple(
@@ -427,6 +428,22 @@ def run_detection(img_bgr: np.ndarray, conf: float, classes: list[int] | tuple[i
                 cls_name = "table"
             detections.append({"cls": cls_name, "conf": round(float(p), 3), "box": b})
 
+    # Seat occupancy: which detected CHAIRS actually have a person on them,
+    # not just "chairs minus people" — a room can have more people standing
+    # than chairs, or people clustered near empty chairs, and a raw count
+    # subtraction gets both wrong. match_chairs_to_occupants scores each
+    # chair by how much of it a person's box covers (see core/seat_geometry),
+    # which is what "is that empty chair actually empty" really means.
+    chair_indices = [i for i, d in enumerate(detections) if d["cls"] == "chair"]
+    person_boxes = np.array(
+        [d["box"] for d in detections if d["cls"] == "person"], dtype=np.float64)
+    chair_boxes = np.array([detections[i]["box"] for i in chair_indices], dtype=np.float64)
+    chair_assignments = match_chairs_to_occupants(chair_boxes, person_boxes) if chair_indices else []
+    for idx, assignment in zip(chair_indices, chair_assignments):
+        detections[idx]["occupied"] = assignment.occupied
+    occupied_chair_count = sum(1 for a in chair_assignments if a.occupied)
+    chair_count = len(chair_indices)
+
     annotated = result.plot()  # BGR ndarray with boxes + labels drawn
     if thumb_width:
         annotated = _resize_max_width(annotated, thumb_width)
@@ -440,6 +457,9 @@ def run_detection(img_bgr: np.ndarray, conf: float, classes: list[int] | tuple[i
         "n_detections": len(detections),
         "counts": counts,
         "person_count": counts.get("person", 0),
+        "chair_count": chair_count,
+        "occupied_chair_count": occupied_chair_count,
+        "available_chair_count": chair_count - occupied_chair_count,
         "detections": detections,
         "annotated_image": f"data:image/jpeg;base64,{b64}",
     }
